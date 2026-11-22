@@ -25,8 +25,24 @@ a um único detalhe. Cada item válido da página pode exigir um GET adicional.
 O comando limita retentativas e tamanho de resposta, recusa redirecionamentos
 e valida a origem e os filtros do próximo link. A confirmação da página
 e o checkpoint são persistidos juntos. Um 404 no detalhe vai para a
-quarentena e preserva versões anteriores. O modo de reconsulta periódica
-de IDs conhecidos e o agendamento ficam para uma entrega posterior.
+quarentena e preserva versões anteriores.
+
+## Reconsulta por ID
+
+Use um lote explícito de até 100 IDs oficiais que já tenham sido coletados.
+O comando salva os IDs em ordem crescente, elimina repetições e consulta
+cada detalhe sem reaplicar o intervalo de apresentação. Assim uma correção
+que mude a data para fora do recorte original ainda pode gerar nova versão.
+
+```sh
+python apps/worker/camara.py --refresh 2416804 2416826 --max-items 1
+python apps/worker/camara.py --resume ID_DA_RECONSULTA --max-items 1
+```
+
+O orçamento padrão é de 20 itens por chamada. O resumo de reconsulta usa
+`items` para itens confirmados. Ciclos periódicos podem iniciar um novo lote
+com os mesmos IDs. Execute uma chamada por vez. O agendamento e a seleção
+automática de lotes ficam para uma entrega posterior.
 
 ## Verificação local
 
@@ -43,3 +59,6 @@ Verificação manual em 22 de novembro de 2026 com o intervalo acima.
 A primeira chamada confirmou uma página e pausou. A retomada confirmou
 a segunda página e concluiu a execução. Foram persistidos os IDs oficiais
 2416804, 2416826 e 2416830, sem quarentena nesse recorte.
+
+Na mesma validação, a reconsulta dos IDs 2416804 e 2416826 pausou após o
+primeiro item e concluiu na retomada, sem gerar versões adicionais.

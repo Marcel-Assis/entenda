@@ -5,7 +5,8 @@ from datetime import date, datetime, timezone
 
 import psycopg
 
-from camara import BASE, CursorChanged, Response, create_run, discover, page_url
+from camara import (BASE, CursorChanged, Response, create_refresh_run, create_run,
+                    discover, page_url, refresh)
 
 
 class DiscoveryTest(unittest.TestCase):
@@ -130,3 +131,46 @@ class DiscoveryTest(unittest.TestCase):
                     other.execute("DELETE FROM confirmed_pages WHERE run_id = %s", (run,))
                     other.execute("DELETE FROM observations WHERE run_id = %s", (run,))
                     other.execute("DELETE FROM runs WHERE id = %s", (run,))
+
+    def test_refresh_preserves_batch_and_history(self):
+        discovery = self.new_run()
+        first = page_url(self.scope(discovery), 1)
+        one, two = f"{BASE}/1", f"{BASE}/2"
+        routes = {
+            first: self.response(first, [self.record(1), self.record(2)]),
+            one: self.response(one, self.record(1)),
+            two: self.response(two, self.record(2)),
+        }
+        self.assertEqual(discover(self.db, discovery, 1, routes.__getitem__)["versions"], 2)
+        with self.assertRaisesRegex(ValueError, "já coletados"):
+            create_refresh_run(self.db, [3])
+
+        run = create_refresh_run(self.db, [2, 1, 2])
+        self.assertEqual(self.scope(run), {"ids": [1, 2]})
+        corrected = {**self.record(1, "B"), "dataApresentacao": "2023-12-31T12:00"}
+        routes[one] = self.response(one, corrected)
+        routes[two] = self.response(two, status=503)
+
+        result = refresh(self.db, run, 1, routes.__getitem__)
+        self.assertEqual((result["state"], result["versions"]), ("paused", 1))
+        result = refresh(self.db, run, 2, routes.__getitem__, lambda _: None)
+        self.assertEqual((result["state"], result["items"]), ("failed", 0))
+        self.assertEqual(self.db.execute(
+            "SELECT cursor FROM runs WHERE id = %s", (run,)
+        ).fetchone(), ("1",))
+
+        routes[two] = self.response(two, status=404)
+        result = refresh(self.db, run, 2, routes.__getitem__)
+        self.assertEqual((result["state"], result["quarantined"]), ("completed", 1))
+        self.assertEqual(self.db.execute("""
+            SELECT official_id, version, fields->>'ementa'
+            FROM proposal_versions ORDER BY official_id, version
+            """).fetchall(), [(1, 1, "A"), (1, 2, "B"), (2, 1, "A")])
+        self.assertEqual(self.db.execute("""
+            SELECT official_id, reason FROM quarantine WHERE run_id = %s
+            """, (run,)).fetchall(), [(2, "detail_not_found")])
+
+        result = refresh(self.db, create_refresh_run(self.db, [1]), 1, routes.__getitem__)
+        self.assertEqual(result["versions"], 0)
+        result = refresh(self.db, run, 1, None)
+        self.assertEqual((result["state"], result["items"]), ("completed", 0))
