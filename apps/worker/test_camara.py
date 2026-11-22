@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 import psycopg
 
 from camara import (BASE, CursorChanged, Response, create_refresh_run, create_run,
-                    discover, page_url, refresh)
+                    discover, page_url, refresh, select_refresh_run)
 
 
 class DiscoveryTest(unittest.TestCase):
@@ -174,3 +174,39 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(result["versions"], 0)
         result = refresh(self.db, run, 1, None)
         self.assertEqual((result["state"], result["items"]), ("completed", 0))
+
+    def test_automatic_refresh_rotates_and_resumes_existing_batch(self):
+        self.assertIsNone(select_refresh_run(self.db, 2))
+        discovery = self.new_run()
+        first, second = [page_url(self.scope(discovery), page) for page in (1, 2)]
+        routes = {
+            first: self.response(first, [self.record(1), self.record(2)],
+                                 [{"rel": "next", "href": second}]),
+            second: self.response(second, [self.record(3)]),
+        }
+        for proposal_id in (1, 2, 3):
+            url = f"{BASE}/{proposal_id}"
+            routes[url] = self.response(url, self.record(proposal_id))
+        self.assertEqual(discover(self.db, discovery, 2, routes.__getitem__)["versions"], 3)
+
+        batch = select_refresh_run(self.db, 2)
+        self.assertEqual(self.scope(batch), {"automatic": True, "ids": [1, 2]})
+        self.assertEqual(refresh(self.db, batch, 1, routes.__getitem__)["state"], "paused")
+        self.assertEqual(select_refresh_run(self.db, 1), batch)
+
+        target = f"{BASE}/2"
+        routes[target] = self.response(target, status=503)
+        self.assertEqual(refresh(self.db, batch, 1, routes.__getitem__, lambda _: None)["state"],
+                         "failed")
+        self.assertEqual(select_refresh_run(self.db, 1), batch)
+        self.assertEqual(self.db.execute("""
+            SELECT official_id FROM proposals WHERE last_refresh_at IS NOT NULL
+            """).fetchall(), [(1,)])
+
+        routes[target] = self.response(target, status=404)
+        result = refresh(self.db, batch, 1, routes.__getitem__)
+        self.assertEqual((result["state"], result["quarantined"]), ("completed", 1))
+        second_batch = select_refresh_run(self.db, 2)
+        self.assertEqual(self.scope(second_batch)["ids"], [1, 3])
+        self.assertEqual(refresh(self.db, second_batch, 2, routes.__getitem__)["state"], "completed")
+        self.assertEqual(self.scope(select_refresh_run(self.db, 1))["ids"], [2])

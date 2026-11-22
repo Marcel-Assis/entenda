@@ -314,7 +314,7 @@ def record_failure(db, run_id, cursor, observations):
                    (run_id,))
 
 
-def create_refresh_run(db, proposal_ids):
+def create_refresh_run(db, proposal_ids, *, automatic=False):
     proposal_ids = sorted(set(proposal_ids))
     if not 1 <= len(proposal_ids) <= 100 or any(not 0 < value < 2**63 for value in proposal_ids):
         raise ValueError("informe de 1 a 100 IDs oficiais válidos")
@@ -324,10 +324,34 @@ def create_refresh_run(db, proposal_ids):
         """, (proposal_ids,)).fetchall()
     if proposal_ids != [row[0] for row in known]:
         raise ValueError("a reconsulta aceita apenas IDs já coletados")
+    scope = {"ids": proposal_ids}
+    if automatic:
+        scope["automatic"] = True
     return db.execute("""
         INSERT INTO runs (mode, scope, state, cursor)
         VALUES ('refresh', %s, 'running', '0') RETURNING id
-        """, (Jsonb({"ids": proposal_ids}),)).fetchone()[0]
+        """, (Jsonb(scope),)).fetchone()[0]
+
+
+def select_refresh_run(db, batch_size):
+    if not 1 <= batch_size <= 100:
+        raise ValueError("o lote automático deve ter entre 1 e 100 IDs")
+    with db.transaction():
+        # Serialize selection across invocations before checking for a pending batch.
+        db.execute("SELECT pg_advisory_xact_lock(3142024, 1)")
+        pending = db.execute("""
+            SELECT id FROM runs
+            WHERE mode = 'refresh' AND cursor IS NOT NULL AND scope @> '{"automatic":true}'
+            """).fetchone()
+        if pending:
+            return pending[0]
+        candidates = db.execute("""
+            SELECT official_id FROM proposals WHERE source = 'camara'
+            ORDER BY last_refresh_at NULLS FIRST, official_id LIMIT %s
+            """, (batch_size,)).fetchall()
+        if not candidates:
+            return None
+        return create_refresh_run(db, [row[0] for row in candidates], automatic=True)
 
 
 def refresh(db, run_id, max_items, transport=request, sleep=time.sleep):
@@ -363,6 +387,10 @@ def refresh(db, run_id, max_items, transport=request, sleep=time.sleep):
                 summary["quarantined"] += 1
             else:
                 summary["versions"] += store_version(db, proposal_id, fields, evidence)
+            db.execute("""
+                UPDATE proposals SET last_refresh_at = clock_timestamp()
+                WHERE source = 'camara' AND official_id = %s
+                """, (proposal_id,))
             db.execute("UPDATE runs SET cursor = %s, state = %s, updated_at = now() WHERE id = %s",
                        (next_cursor, state, run_id))
         cursor = next_cursor
@@ -374,7 +402,9 @@ def main():
     parser = argparse.ArgumentParser(description="Coleta e reconsulta manual de proposições da Câmara")
     parser.add_argument("--max-pages", type=int)
     parser.add_argument("--max-items", type=int)
-    parser.add_argument("--refresh", type=int, nargs="+", metavar="ID")
+    refresh_mode = parser.add_mutually_exclusive_group()
+    refresh_mode.add_argument("--refresh", type=int, nargs="+", metavar="ID")
+    refresh_mode.add_argument("--refresh-next", type=int, metavar="TAMANHO")
     parser.add_argument("--items", type=int)
     parser.add_argument("--from", dest="start", type=date.fromisoformat)
     parser.add_argument("--to", dest="end", type=date.fromisoformat)
@@ -384,12 +414,14 @@ def main():
         parser.error("--max-pages deve estar entre 1 e 20")
     if args.max_items is not None and not 1 <= args.max_items <= 100:
         parser.error("--max-items deve estar entre 1 e 100")
+    if args.refresh_next is not None and not 1 <= args.refresh_next <= 100:
+        parser.error("--refresh-next deve estar entre 1 e 100")
     if args.resume is not None:
-        if args.resume < 1 or any(value is not None for value in (args.start, args.end, args.items, args.refresh)):
+        if args.resume < 1 or any(value is not None for value in (args.start, args.end, args.items, args.refresh, args.refresh_next)):
             parser.error("--resume exige ID positivo e reutiliza o recorte salvo")
-    elif args.refresh is not None:
+    elif args.refresh is not None or args.refresh_next is not None:
         if any(value is not None for value in (args.start, args.end, args.items, args.max_pages)):
-            parser.error("--refresh usa IDs oficiais e --max-items")
+            parser.error("reconsulta usa --max-items e dispensa filtros de descoberta")
     elif args.max_items is not None:
         parser.error("--max-items exige reconsulta")
     elif not (args.start and args.end and args.start <= args.end
@@ -407,6 +439,13 @@ def main():
                 if row is None:
                     raise ValueError("execução inexistente")
                 mode = row[0]
+            elif args.refresh_next is not None:
+                mode = "refresh"
+                run_id = select_refresh_run(db, args.refresh_next)
+                if run_id is None:
+                    print(json.dumps({"run_id": None, "state": "empty", "items": 0,
+                                      "versions": 0, "quarantined": 0}))
+                    return 0
             elif args.refresh is not None:
                 mode = "refresh"
                 run_id = create_refresh_run(db, args.refresh)
