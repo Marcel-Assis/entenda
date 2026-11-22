@@ -28,3 +28,12 @@ Construir uma plataforma brasileira de informação e transparência pública, b
 4. Documentar decisões relevantes e alterações de esquema.
 5. Não afirmar que publicação, testes, integração ou deploy foram concluídos sem confirmação.
 6. Exigir aprovação antes de produção, operações destrutivas, gastos, mudanças de segurança ou publicação editorial.
+
+## Acompanhamento persistente
+
+1. Antes de iniciar uma atividade, consulte [Estado do projeto](docs/PROJECT_STATUS.md), [Bloqueios](docs/BLOCKERS.md) e as issues e PRs abertos. Confira a referência atual de `main` e as branches em revisão para evitar retrabalho.
+2. Atualize os registros a cada etapa relevante. Em `docs/PROJECT_STATUS.md`, registre entregas concluídas e verificadas, atividades em andamento, pendentes e bloqueadas. Distinga implementação, testes executados, integração à `main` e disponibilidade verificada em produção.
+3. Vincule cada atividade à issue, à branch, ao commit e ao PR quando existirem. Indique quando um PR ainda precisa ser aberto e inclua a comparação entre branches. Registre as verificações que passaram e as que ficaram pendentes.
+4. Em `docs/BLOCKERS.md`, registre falhas ou dependências externas com causa observada, impacto e ação necessária. Inclua a decisão, permissão, credencial ou acesso exigido, sem expor valores secretos. Continue entregas independentes quando for seguro e atualize o registro quando houver evidência de resolução.
+5. Se os registros estiverem fora da `main`, identifique a branch e mantenha um resumo correspondente na issue ou no PR da tarefa. Se a publicação externa falhar, preserve o resumo na branch, registre a falha e deixe o texto pronto para publicação pelo canal autorizado.
+6. Trabalhe em branches específicas e prepare PRs para revisão. A integração à `main` depende de revisão e não deve ocorrer automaticamente.
