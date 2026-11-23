@@ -21,13 +21,10 @@ vale para as dependências e a base consultadas naquela execução.
    branch específica a partir de `main` atualizada ou da branch que fornece
    a dependência imediata. Abra o PR contra essa base e indique a cadeia no
    resumo, com os testes executados e os pendentes.
-2. Revise os PRs em ordem de dependência. Nesta entrega, `main` em
-   `44a097f` só contém a fundação. As auditorias e o acompanhamento têm
-   seus próprios PRs. A implementação está nos PRs [#5–#9](https://github.com/Marcel-Assis/entenda/pulls),
-   do modelo ao rodízio. A CI parte de `feat/camara-refresh-batches`.
-   Retargete o PR da CI quando a sua base estiver integrada. Após merges
-   por squash, confira o diff e reaplique apenas os commits próprios
-   se a troca de base mostrar alterações que já foram integradas.
+2. Revise os PRs em ordem de dependência. Os PRs #6–#9 foram integrados
+   em branches intermediárias. A branch `integration/worker-ci` reúne
+   o worker, as migrações e a CI contra a `main` `4055103`. As auditorias,
+   o modelo documental e o acompanhamento já estão na `main`.
 3. Antes de tornar a CI obrigatória globalmente, integre o worker e
    confirme o check em um PR representativo contra `main`. O job exige
    os arquivos do worker e das migrações. Privilégios e regras do GitHub
