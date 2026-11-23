@@ -154,6 +154,23 @@ def in_scope(item, scope):
     )
 
 
+def fetch_detail(proposal_id, observations, transport, sleep, scope=None):
+    detail = fetch(f"{BASE}/{proposal_id}", observations, transport, sleep)
+    if detail.status == 404:
+        return detail, None, "detail_not_found"
+    if detail.status != 200 or detail.body is None:
+        raise PageError(f"detail_failed: {detail.status or detail.error}")
+    try:
+        record = payload(detail).get("dados")
+        if official_id(record) != proposal_id or (scope is not None and not in_scope(record, scope)):
+            raise PageError("invalid_detail_item")
+        fields = {key: record[key] for key in FIELDS if key in record}
+        json.dumps(fields, allow_nan=False, ensure_ascii=False).encode("utf-8")
+    except ValueError:
+        return detail, None, "invalid_detail_item"
+    return detail, fields, None
+
+
 def store_observation(db, run_id, response):
     digest = None
     if response.body is not None:
@@ -238,29 +255,15 @@ def discover(db, run_id, max_pages, transport=request, sleep=time.sleep):
                     continue
                 if proposal_id in versions:
                     continue
-                detail = fetch(f"{BASE}/{proposal_id}", observations, transport, sleep)
-                if detail.status == 404:
-                    quarantine.append((detail, position, proposal_id, "detail_not_found"))
-                    continue
-                if detail.status != 200 or detail.body is None:
-                    raise PageError(f"detail_failed: {detail.status or detail.error}")
-                try:
-                    record = payload(detail).get("dados")
-                    if official_id(record) != proposal_id or not in_scope(record, scope):
-                        raise PageError("invalid_detail_item")
-                    fields = {key: record[key] for key in FIELDS if key in record}
-                    json.dumps(fields, allow_nan=False).encode("utf-8")
-                except ValueError:
-                    quarantine.append((detail, position, proposal_id, "invalid_detail_item"))
-                    continue
-                versions[proposal_id] = (fields, detail)
+                detail, fields, reason = fetch_detail(
+                    proposal_id, observations, transport, sleep, scope
+                )
+                if reason:
+                    quarantine.append((detail, position, proposal_id, reason))
+                else:
+                    versions[proposal_id] = (fields, detail)
         except ValueError as error:
-            with db.transaction():
-                lock_checkpoint(db, run_id, cursor)
-                for response in observations:
-                    store_observation(db, run_id, response)
-                db.execute("UPDATE runs SET state = 'failed', updated_at = now() WHERE id = %s",
-                           (run_id,))
+            record_failure(db, run_id, cursor, observations)
             return {**summary, "state": "failed", "error": str(error)}
 
         with db.transaction():
@@ -270,10 +273,7 @@ def discover(db, run_id, max_pages, transport=request, sleep=time.sleep):
             for proposal_id, (fields, detail) in sorted(versions.items()):
                 summary["versions"] += store_version(db, proposal_id, fields, evidence[id(detail)])
             for response, position, proposal_id, reason in quarantine:
-                db.execute("""
-                    INSERT INTO quarantine (run_id, observation_id, item_index, official_id, reason)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """, (run_id, evidence[id(response)], position, proposal_id, reason))
+                store_quarantine(db, run_id, evidence[id(response)], position, proposal_id, reason)
             db.execute("INSERT INTO confirmed_pages VALUES (%s, %s, %s)",
                        (run_id, str(current), evidence[id(listing)]))
             state = "completed" if next_url is None else (
@@ -298,19 +298,100 @@ def create_run(db, start, end, items):
         """, (Jsonb(scope), page_url(scope, 1))).fetchone()[0]
 
 
+def store_quarantine(db, run_id, evidence, position, proposal_id, reason):
+    db.execute("""
+        INSERT INTO quarantine (run_id, observation_id, item_index, official_id, reason)
+        VALUES (%s, %s, %s, %s, %s)
+        """, (run_id, evidence, position, proposal_id, reason))
+
+
+def record_failure(db, run_id, cursor, observations):
+    with db.transaction():
+        lock_checkpoint(db, run_id, cursor)
+        for response in observations:
+            store_observation(db, run_id, response)
+        db.execute("UPDATE runs SET state = 'failed', updated_at = now() WHERE id = %s",
+                   (run_id,))
+
+
+def create_refresh_run(db, proposal_ids):
+    proposal_ids = sorted(set(proposal_ids))
+    if not 1 <= len(proposal_ids) <= 100 or any(not 0 < value < 2**63 for value in proposal_ids):
+        raise ValueError("informe de 1 a 100 IDs oficiais válidos")
+    known = db.execute("""
+        SELECT official_id FROM proposals WHERE source = 'camara' AND official_id = ANY(%s)
+        ORDER BY official_id
+        """, (proposal_ids,)).fetchall()
+    if proposal_ids != [row[0] for row in known]:
+        raise ValueError("a reconsulta aceita apenas IDs já coletados")
+    return db.execute("""
+        INSERT INTO runs (mode, scope, state, cursor)
+        VALUES ('refresh', %s, 'running', '0') RETURNING id
+        """, (Jsonb({"ids": proposal_ids}),)).fetchone()[0]
+
+
+def refresh(db, run_id, max_items, transport=request, sleep=time.sleep):
+    run = db.execute("SELECT scope, cursor, state FROM runs WHERE id = %s AND mode = 'refresh'",
+                     (run_id,)).fetchone()
+    if run is None:
+        raise ValueError("execução de reconsulta inexistente")
+    scope, cursor, state = run
+    summary = {"run_id": run_id, "state": state, "items": 0, "versions": 0, "quarantined": 0}
+    ids = scope["ids"]
+    for _ in range(max_items):
+        if cursor is None:
+            break
+        position = int(cursor)
+        proposal_id = ids[position]
+        observations = []
+        try:
+            detail, fields, reason = fetch_detail(proposal_id, observations, transport, sleep)
+        except PageError as error:
+            record_failure(db, run_id, cursor, observations)
+            return {**summary, "state": "failed", "error": str(error)}
+
+        next_cursor = str(position + 1) if position + 1 < len(ids) else None
+        state = "completed" if next_cursor is None else (
+            "paused" if summary["items"] + 1 == max_items else "running"
+        )
+        with db.transaction():
+            lock_checkpoint(db, run_id, cursor)
+            for response in observations:
+                evidence = store_observation(db, run_id, response)
+            if reason:
+                store_quarantine(db, run_id, evidence, position, proposal_id, reason)
+                summary["quarantined"] += 1
+            else:
+                summary["versions"] += store_version(db, proposal_id, fields, evidence)
+            db.execute("UPDATE runs SET cursor = %s, state = %s, updated_at = now() WHERE id = %s",
+                       (next_cursor, state, run_id))
+        cursor = next_cursor
+        summary.update(state=state, items=summary["items"] + 1)
+    return summary
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--max-pages", type=int, default=2)
+    parser = argparse.ArgumentParser(description="Coleta e reconsulta manual de proposições da Câmara")
+    parser.add_argument("--max-pages", type=int)
+    parser.add_argument("--max-items", type=int)
+    parser.add_argument("--refresh", type=int, nargs="+", metavar="ID")
     parser.add_argument("--items", type=int)
     parser.add_argument("--from", dest="start", type=date.fromisoformat)
     parser.add_argument("--to", dest="end", type=date.fromisoformat)
     parser.add_argument("--resume", type=int)
     args = parser.parse_args()
-    if not 1 <= args.max_pages <= 20:
+    if args.max_pages is not None and not 1 <= args.max_pages <= 20:
         parser.error("--max-pages deve estar entre 1 e 20")
+    if args.max_items is not None and not 1 <= args.max_items <= 100:
+        parser.error("--max-items deve estar entre 1 e 100")
     if args.resume is not None:
-        if args.resume < 1 or any(value is not None for value in (args.start, args.end, args.items)):
+        if args.resume < 1 or any(value is not None for value in (args.start, args.end, args.items, args.refresh)):
             parser.error("--resume exige ID positivo e reutiliza o recorte salvo")
+    elif args.refresh is not None:
+        if any(value is not None for value in (args.start, args.end, args.items, args.max_pages)):
+            parser.error("--refresh usa IDs oficiais e --max-items")
+    elif args.max_items is not None:
+        parser.error("--max-items exige reconsulta")
     elif not (args.start and args.end and args.start <= args.end
               and (args.items is None or 1 <= args.items <= 20)):
         parser.error("informe --from e --to em ordem e --items entre 1 e 20, se indicado")
@@ -320,9 +401,27 @@ def main():
     try:
         with psycopg.connect(dsn, autocommit=True) as db:
             db.execute("SET search_path TO camara_ingestion, pg_catalog")
-            run_id = args.resume or create_run(db, args.start, args.end, args.items or 2)
+            if args.resume is not None:
+                run_id = args.resume
+                row = db.execute("SELECT mode FROM runs WHERE id = %s", (run_id,)).fetchone()
+                if row is None:
+                    raise ValueError("execução inexistente")
+                mode = row[0]
+            elif args.refresh is not None:
+                mode = "refresh"
+                run_id = create_refresh_run(db, args.refresh)
+            else:
+                mode = "discovery"
+                run_id = create_run(db, args.start, args.end, args.items or 2)
+            if mode == "refresh" and args.max_pages is not None:
+                parser.error("reconsulta usa --max-items")
+            if mode == "discovery" and args.max_items is not None:
+                parser.error("descoberta usa --max-pages")
             print(json.dumps({"run_id": run_id}), flush=True)
-            result = discover(db, run_id, args.max_pages)
+            if mode == "refresh":
+                result = refresh(db, run_id, args.max_items or 20)
+            else:
+                result = discover(db, run_id, args.max_pages or 2)
     except (ValueError, CursorChanged) as error:
         parser.exit(1, f"{error}\n")
     print(json.dumps(result))
