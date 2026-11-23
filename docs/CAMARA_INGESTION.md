@@ -30,3 +30,16 @@ A representação normalizada inicial preserva `siglaTipo`, `codTipo`, `numero`,
 - Manter o armazenamento bruto no lado do servidor, limitar acesso na migração antes de expor a API e verificar as políticas com os papéis previstos. A publicação editorial segue o fluxo de revisão humana do projeto.
 
 A primeira entrega executável proposta é a migração com restrições de integridade e testes locais de persistência. O worker fica para uma entrega seguinte, com os contratos de confirmação e retomada acima.
+
+## Migração e teste local
+
+A [migração inicial](../supabase/migrations/20261122131500_camara_ingestion.sql) cria o esquema privado `camara_ingestion` com RLS ativa. A autorização do papel dedicado ao worker e a configuração de qualquer ambiente compartilhado ficam para a integração posterior.
+
+Em um banco PostgreSQL 17 descartável e vazio, execute com um papel administrador local. O teste cria um papel temporário dentro da transação e encerra com rollback.
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/20261122131500_camara_ingestion.sql
+psql -X -v ON_ERROR_STOP=1 -f supabase/tests/camara_ingestion.sql
+```
+
+O SQL estabelece as restrições e demonstra o contrato transacional em um teste. O worker será responsável por fazer a confirmação dentro de uma transação, bloquear o checkpoint e comparar o cursor esperado antes de gravar a página. A concorrência entre execuções será testada com o worker.
